@@ -1,8 +1,63 @@
-// backend/controllers/urlController.js
 const Url = require("../models/Url");
 const crypto = require("crypto");
 
-// Convert SHA256 to base62
+function validateAndNormalizeUrl(input) {
+  if (!input || typeof input !== 'string') {
+    return { valid: false, error: "URL is required" };
+  }
+  
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return { valid: false, error: "URL cannot be empty" };
+  }
+  
+  // Block invalid inputs first
+  if (!/[a-zA-Z]/.test(trimmed)) {
+    return { valid: false, error: "Please enter a valid URL" };
+  }
+  
+  // Check for double dots (invalid)
+  if (trimmed.includes('..')) {
+    return { valid: false, error: "Invalid URL format" };
+  }
+  
+  // Check for misspelled protocols
+  if (/^(htp|htps|http|https):\/\//.test(trimmed) && !/^https?:\/\//.test(trimmed)) {
+    return { valid: false, error: "Invalid protocol. Use http:// or https://" };
+  }
+  
+  // Check for incomplete protocols
+  if (trimmed === 'http://' || trimmed === 'https://') {
+    return { valid: false, error: "Please enter a complete URL" };
+  }
+  
+  // Normalize URL - add https:// if no protocol
+  let normalizedUrl = trimmed;
+  if (!/^https?:\/\//.test(trimmed) && !/^ftp:\/\//.test(trimmed)) {
+    normalizedUrl = `https://${trimmed}`;
+  }
+  
+  // Final validation with URL constructor
+  try {
+    const urlObj = new URL(normalizedUrl);
+    
+    // Allow http, https, and ftp protocols
+    if (!['http:', 'https:', 'ftp:'].includes(urlObj.protocol)) {
+      return { valid: false, error: "Only HTTP, HTTPS, and FTP URLs are supported" };
+    }
+    
+    // Check for valid hostname (must contain at least one dot for domain)
+    if (!urlObj.hostname.includes('.') && !urlObj.hostname.startsWith('localhost')) {
+      return { valid: false, error: "Please enter a valid domain name" };
+    }
+    
+    return { valid: true, url: urlObj.href };
+  } catch {
+    return { valid: false, error: "Invalid URL format" };
+  }
+}
+
+// Convert string to base62 hash
 function base62(input) {
   const hash = crypto.createHash("sha256").update(input).digest("hex");
   const chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -42,45 +97,53 @@ function nextPrime(current) {
   return smallestPrime(current + 1);
 }
 
-// Build short URL for response
+// Build complete short URL
 function buildShortUrl(shortCode) {
   const base = process.env.BACKEND_URL || "http://localhost:5000";
   return `${base}/r/${shortCode}`;
 }
 
-// POST /shorten - Create short URL following exact requirements
+// Create short URL with collision resolution
+
 exports.shortenUrl = async (req, res) => {
   try {
     const { longUrl } = req.body;
     
-    if (!longUrl) {
-      return res.status(400).json({ error: "longUrl is required" });
+    // Validate and normalize URL
+    const validation = validateAndNormalizeUrl(longUrl);
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.error });
+    }
+    
+    const normalizedUrl = validation.url;
+
+    // STEP 1: Check if URL already exists - DETERMINISTIC REQUIREMENT
+    const existing = await Url.findOne({ longUrl: normalizedUrl });
+    if (existing) {
+      return res.json({
+        shortCode: existing.shortCode,
+        shortUrl: buildShortUrl(existing.shortCode),
+        longUrl: existing.longUrl
+      });
     }
 
-    // Step 1: n = count(active docs), L = smallest_prime(n + 1)
+    // STEP 2: Generate new short code following prime-length logic
     const n = await Url.countDocuments();
     let L = smallestPrime(n + 1);
+    const h = base62(normalizedUrl);
 
-    // Step 2: Compute h = base62(sha256(longUrl))
-    const h = base62(longUrl);
-
-    // Cap total probe attempts to avoid infinite loops
     const MAX_PROBE_ATTEMPTS = 10;
     let attempts = 0;
 
     while (attempts < MAX_PROBE_ATTEMPTS) {
-      // Take first L chars as candidate
       const candidate = h.slice(0, L);
+      const existingCode = await Url.findOne({ shortCode: candidate });
 
-      // Step 3: Check if candidate exists
-      const existing = await Url.findOne({ shortCode: candidate });
-
-      if (!existing) {
-        // No collision - insert new record
+      if (!existingCode) {
+        // No collision - create new entry
         try {
-          // Step 4: Insert { longUrl, shortCode, createdAt }
           const newUrl = await Url.create({
-            longUrl,
+            longUrl: normalizedUrl,
             shortCode: candidate,
             createdAt: new Date()
           });
@@ -92,9 +155,8 @@ exports.shortenUrl = async (req, res) => {
           });
 
         } catch (error) {
-          
+          // Handle race condition duplicate key
           if (error.code === 11000) {
-          
             L = nextPrime(L);
             attempts++;
             continue;
@@ -103,25 +165,14 @@ exports.shortenUrl = async (req, res) => {
         }
 
       } else {
-        // Candidate exists - check if same longUrl
-        if (existing.longUrl === longUrl) {
-          // Same longUrl → return existing (deterministic)
-          return res.json({
-            shortCode: existing.shortCode,
-            shortUrl: buildShortUrl(existing.shortCode),
-            longUrl: existing.longUrl
-          });
-        } else {
-          // Different longUrl → collision: compute L2 = next_prime(L+1)
-          L = nextPrime(L);
-          attempts++;
-        }
+        // Collision detected - try next prime length
+        L = nextPrime(L);
+        attempts++;
       }
     }
 
-    // Max probe attempts reached
     return res.status(500).json({ 
-      error: "Failed to generate unique short code (max probe attempts reached)" 
+      error: "Failed to generate unique short code (max attempts reached)" 
     });
 
   } catch (error) {
@@ -129,8 +180,7 @@ exports.shortenUrl = async (req, res) => {
     return res.status(500).json({ error: "Server error" });
   }
 };
-
-// GET /r/:shortCode → redirect or 404
+// Redirect short URL to long URL
 exports.redirectUrl = async (req, res) => {
   try {
     const { shortCode } = req.params;
@@ -141,7 +191,6 @@ exports.redirectUrl = async (req, res) => {
       return res.status(404).send("404 - Short link not found");
     }
     
-    // Redirect to longUrl
     return res.redirect(urlDoc.longUrl);
     
   } catch (error) {

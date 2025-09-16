@@ -7,7 +7,7 @@ export default function UrlCard({ shortUrl }) {
     try {
       await navigator.clipboard.writeText(shortUrl);
       setCopied(true);
-      setTimeout(() => setCopied(false), 2000); // Reset after 2 seconds
+      setTimeout(() => setCopied(false), 2000); 
     } catch (err) {
       console.error('Failed to copy: ', err);
     }
